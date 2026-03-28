@@ -1,5 +1,3 @@
-// Shared types between frontend and backend
-
 export interface StockPrice {
   symbol: string;
   price: number;
@@ -7,9 +5,21 @@ export interface StockPrice {
   timestamp: number;
 }
 
+export interface NewsEvent {
+  headline: string;
+  timestamp: number;
+}
+
+export interface HeartbeatEvent {
+  time: number;
+}
+
+export type SSEEventType = "stock-update" | "news" | "heartbeat";
+
 export interface ServerEvent {
-  type: "stock-update" | "news" | "heartbeat";
-  data: StockPrice | string;
+  type: SSEEventType;
+  data: StockPrice | NewsEvent | HeartbeatEvent;
 }
 
 export const STOCKS = ["AAPL", "GOOGL", "MSFT", "AMZN", "TSLA"] as const;
+export type StockSymbol = (typeof STOCKS)[number];

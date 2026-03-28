@@ -1,19 +1,8 @@
 import { useEffect, useRef, useState, useCallback } from "react";
 
-// ============================================
-// CUSTOM HOOK: useSSE — SSE Client Side
-// ============================================
-// How EventSource (SSE client) works:
-// 1. Browser creates a persistent HTTP connection via new EventSource(url)
-// 2. Browser auto-reconnects if connection drops
-// 3. You listen for named events with .addEventListener("event-name", handler)
-// 4. Each event has a .data property with the JSON string
-// 5. Connection is one-way: server → client only
-// ============================================
-
 interface UseSSEOptions {
   url: string;
-  events: string[]; // which named events to listen for
+  events: string[];
 }
 
 interface SSEState<T> {
@@ -22,6 +11,7 @@ interface SSEState<T> {
   isConnected: boolean;
   error: string | null;
   history: Array<{ event: string; data: T; time: Date }>;
+  reconnectCount: number;
 }
 
 export function useSSE<T>({ url, events }: UseSSEOptions) {
@@ -31,36 +21,39 @@ export function useSSE<T>({ url, events }: UseSSEOptions) {
     isConnected: false,
     error: null,
     history: [],
+    reconnectCount: 0,
   });
 
   const eventSourceRef = useRef<EventSource | null>(null);
+  const handlersRef = useRef<Array<{ event: string; handler: (e: MessageEvent) => void }>>([]);
 
   const connect = useCallback(() => {
-    // Step 1: Create EventSource — browser opens persistent GET request
     const es = new EventSource(url);
     eventSourceRef.current = es;
 
-    // Step 2: Handle connection open
     es.onopen = () => {
       setState((prev) => ({ ...prev, isConnected: true, error: null }));
-      console.log("SSE Connected!");
     };
 
-    // Step 3: Handle default messages (no event name)
     es.onmessage = (event) => {
       try {
         const parsed = JSON.parse(event.data);
-        console.log("Default message:", parsed);
+        // Handle server shutdown notification
+        if (parsed.type === "server-shutdown") {
+          setState((prev) => ({
+            ...prev,
+            isConnected: false,
+            error: "Server shutting down...",
+          }));
+        }
       } catch {
-        console.log("Raw message:", event.data);
+        // Non-JSON default message, ignore
       }
     };
 
-    // Step 4: Listen for NAMED events
-    // When server sends "event: stock-update\ndata: {...}\n\n"
-    // we catch it with addEventListener("stock-update", ...)
+    const handlers: typeof handlersRef.current = [];
     for (const eventName of events) {
-      es.addEventListener(eventName, (event) => {
+      const handler = (event: MessageEvent) => {
         try {
           const parsed = JSON.parse(event.data) as T;
           setState((prev) => ({
@@ -69,33 +62,66 @@ export function useSSE<T>({ url, events }: UseSSEOptions) {
             lastEvent: eventName,
             history: [
               { event: eventName, data: parsed, time: new Date() },
-              ...prev.history.slice(0, 49), // keep last 50
+              ...prev.history.slice(0, 49),
             ],
           }));
         } catch (err) {
           console.error(`Failed to parse ${eventName}:`, err);
         }
-      });
+      };
+      es.addEventListener(eventName, handler);
+      handlers.push({ event: eventName, handler });
     }
 
-    // Step 5: Handle errors (browser auto-reconnects!)
+    // Listen for server shutdown event
+    const shutdownHandler = () => {
+      es.close();
+      setState((prev) => ({
+        ...prev,
+        isConnected: false,
+        error: "Server shutting down — will reconnect when available",
+      }));
+    };
+    es.addEventListener("server-shutdown", shutdownHandler);
+    handlers.push({ event: "server-shutdown", handler: shutdownHandler });
+
+    handlersRef.current = handlers;
+
     es.onerror = () => {
       setState((prev) => ({
         ...prev,
         isConnected: false,
         error: "Connection lost — reconnecting...",
+        reconnectCount: prev.reconnectCount + 1,
       }));
-      // EventSource automatically retries — no manual reconnect needed!
     };
   }, [url, events]);
 
-  // Connect on mount, disconnect on unmount
   useEffect(() => {
     connect();
     return () => {
-      eventSourceRef.current?.close();
+      const es = eventSourceRef.current;
+      if (es) {
+        for (const { event, handler } of handlersRef.current) {
+          es.removeEventListener(event, handler);
+        }
+        es.close();
+      }
+      handlersRef.current = [];
     };
   }, [connect]);
 
-  return state;
+  const disconnect = useCallback(() => {
+    const es = eventSourceRef.current;
+    if (es) {
+      for (const { event, handler } of handlersRef.current) {
+        es.removeEventListener(event, handler);
+      }
+      es.close();
+    }
+    handlersRef.current = [];
+    setState((prev) => ({ ...prev, isConnected: false, error: null }));
+  }, []);
+
+  return { ...state, disconnect, reconnect: connect };
 }

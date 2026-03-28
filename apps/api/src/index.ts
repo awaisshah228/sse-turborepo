@@ -4,56 +4,50 @@ import type { Request, Response } from "express";
 import { STOCKS, type StockPrice } from "@repo/shared";
 
 const app = express();
-app.use(cors());
+
+const ALLOWED_ORIGINS = process.env.CORS_ORIGIN
+  ? process.env.CORS_ORIGIN.split(",")
+  : ["http://localhost:3000"];
+
+app.use(
+  cors({
+    origin: ALLOWED_ORIGINS,
+    credentials: true,
+  })
+);
+
+// Health check
+app.get("/health", (_req: Request, res: Response) => {
+  res.json({ status: "ok", uptime: process.uptime(), clients: clients.size });
+});
 
 // Store connected SSE clients
 const clients: Set<Response> = new Set();
 
-// ============================================
-// SSE ENDPOINT — This is the key part!
-// ============================================
-// How SSE works:
-// 1. Client sends a regular GET request
-// 2. Server sets special headers to keep connection open
-// 3. Server sends "data: ...\n\n" formatted messages
-// 4. Connection stays open — server pushes data whenever it wants
-// 5. Client receives events via EventSource API
-// ============================================
-
 app.get("/api/stream", (req: Request, res: Response) => {
-  // Step 1: Set SSE headers
-  // These headers tell the browser:
-  // - "text/event-stream" = this is an SSE connection
-  // - "no-cache" = don't cache this response
-  // - "keep-alive" = keep the TCP connection open
   res.setHeader("Content-Type", "text/event-stream");
   res.setHeader("Cache-Control", "no-cache");
   res.setHeader("Connection", "keep-alive");
+  res.setHeader("X-Accel-Buffering", "no"); // Disable nginx buffering
 
-  // Step 2: Flush headers immediately (starts the stream)
   res.flushHeaders();
 
-  // Step 3: Send initial connection message
-  // SSE format: "data: <json>\n\n" (double newline = end of message)
-  res.write(`data: ${JSON.stringify({ type: "connected", message: "SSE stream started!" })}\n\n`);
+  // Send retry directive so clients reconnect after 3s on disconnect
+  res.write("retry: 3000\n\n");
+  res.write(
+    `data: ${JSON.stringify({ type: "connected", message: "SSE stream started!" })}\n\n`
+  );
 
-  // Step 4: Add this client to our set
   clients.add(res);
   console.log(`Client connected. Total clients: ${clients.size}`);
 
-  // Step 5: Clean up when client disconnects
   req.on("close", () => {
     clients.delete(res);
     console.log(`Client disconnected. Total clients: ${clients.size}`);
   });
 });
 
-// ============================================
-// SIMULATE REAL-TIME STOCK DATA
-// ============================================
-// Every second, generate random stock prices
-// and push them to ALL connected clients
-
+// Stock price state
 const stockPrices: Record<string, number> = {
   AAPL: 178.5,
   GOOGL: 141.2,
@@ -62,10 +56,10 @@ const stockPrices: Record<string, number> = {
   TSLA: 248.3,
 };
 
+let eventId = 0;
+
 function generateStockUpdate(): StockPrice {
-  // Pick a random stock
   const symbol = STOCKS[Math.floor(Math.random() * STOCKS.length)];
-  // Random price change between -2% and +2%
   const change = (Math.random() - 0.5) * 4;
   stockPrices[symbol] += change;
 
@@ -77,28 +71,36 @@ function generateStockUpdate(): StockPrice {
   };
 }
 
-// Broadcast to all connected clients
 function broadcast(eventName: string, data: unknown) {
-  const message = `event: ${eventName}\ndata: ${JSON.stringify(data)}\n\n`;
-  //                ↑ event name          ↑ JSON payload    ↑ double newline = end
+  eventId++;
+  const message = `id: ${eventId}\nevent: ${eventName}\ndata: ${JSON.stringify(data)}\n\n`;
 
   for (const client of clients) {
-    client.write(message);
+    const ok = client.write(message);
+    if (!ok) {
+      // Client can't keep up — remove it
+      clients.delete(client);
+      client.end();
+    }
   }
 }
 
-// Send stock updates every second
-setInterval(() => {
-  const update = generateStockUpdate();
-  broadcast("stock-update", update);
-}, 1000);
+// Intervals to track for graceful shutdown
+const intervals: NodeJS.Timeout[] = [];
 
-// Send a heartbeat every 15 seconds (keeps connection alive)
-setInterval(() => {
-  broadcast("heartbeat", { time: Date.now() });
-}, 15000);
+intervals.push(
+  setInterval(() => {
+    const update = generateStockUpdate();
+    broadcast("stock-update", update);
+  }, 1000)
+);
 
-// Also send news headlines every 10 seconds
+intervals.push(
+  setInterval(() => {
+    broadcast("heartbeat", { time: Date.now() });
+  }, 15000)
+);
+
 const headlines = [
   "Fed signals potential rate cut in Q3",
   "Tech stocks rally on AI earnings beat",
@@ -107,18 +109,47 @@ const headlines = [
   "Housing market shows signs of cooling",
 ];
 
-setInterval(() => {
-  const headline = headlines[Math.floor(Math.random() * headlines.length)];
-  broadcast("news", { headline, timestamp: Date.now() });
-}, 10000);
+intervals.push(
+  setInterval(() => {
+    const headline = headlines[Math.floor(Math.random() * headlines.length)];
+    broadcast("news", { headline, timestamp: Date.now() });
+  }, 10000)
+);
 
-// REST endpoint for comparison
 app.get("/api/stocks", (_req: Request, res: Response) => {
   res.json(stockPrices);
 });
 
-const PORT = 3001;
-app.listen(PORT, () => {
+const PORT = parseInt(process.env.PORT || "3001", 10);
+const server = app.listen(PORT, () => {
   console.log(`API server running on http://localhost:${PORT}`);
   console.log(`SSE endpoint: http://localhost:${PORT}/api/stream`);
 });
+
+// Graceful shutdown
+function shutdown(signal: string) {
+  console.log(`\n${signal} received. Shutting down gracefully...`);
+
+  // Stop broadcasting
+  for (const interval of intervals) clearInterval(interval);
+
+  // Close all SSE connections
+  for (const client of clients) {
+    client.write(
+      `event: server-shutdown\ndata: ${JSON.stringify({ message: "Server shutting down" })}\n\n`
+    );
+    client.end();
+  }
+  clients.clear();
+
+  server.close(() => {
+    console.log("Server closed.");
+    process.exit(0);
+  });
+
+  // Force exit after 5s
+  setTimeout(() => process.exit(1), 5000);
+}
+
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGINT", () => shutdown("SIGINT"));

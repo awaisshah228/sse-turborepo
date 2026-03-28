@@ -2,18 +2,10 @@
 
 import { useEffect, useRef, useState, useCallback } from "react";
 
-// ============================================
-// CUSTOM HOOK: useWorker
-// ============================================
-// Manages Web Worker lifecycle in React:
-// 1. Creates worker on mount
-// 2. Provides postMessage function
-// 3. Tracks progress and results
-// 4. Terminates worker on unmount
-// ============================================
+type WorkerStatus = "idle" | "running" | "done" | "error";
 
 interface WorkerState {
-  status: "idle" | "running" | "done" | "error";
+  status: WorkerStatus;
   progress: number;
   progressMessage: string;
   result: Record<string, unknown> | null;
@@ -31,11 +23,19 @@ export function useWorker(workerPath: string) {
   });
 
   useEffect(() => {
-    // Create worker (runs in separate thread)
+    // Check for Worker support (SSR safety)
+    if (typeof window === "undefined" || !window.Worker) {
+      setState((prev) => ({
+        ...prev,
+        status: "error",
+        error: "Web Workers are not supported in this environment",
+      }));
+      return;
+    }
+
     const worker = new Worker(workerPath);
     workerRef.current = worker;
 
-    // Listen for messages FROM the worker
     worker.onmessage = (event) => {
       const { type, payload } = event.data;
 
@@ -74,18 +74,18 @@ export function useWorker(workerPath: string) {
       setState((prev) => ({
         ...prev,
         status: "error",
-        error: err.message,
+        error: err.message || "Worker encountered an error",
       }));
     };
 
-    // Cleanup: terminate worker when component unmounts
     return () => {
       worker.terminate();
+      workerRef.current = null;
     };
   }, [workerPath]);
 
-  // Send a task TO the worker
   const run = useCallback((type: string, payload: Record<string, unknown>) => {
+    if (!workerRef.current) return;
     setState({
       status: "running",
       progress: 0,
@@ -93,8 +93,18 @@ export function useWorker(workerPath: string) {
       result: null,
       error: null,
     });
-    workerRef.current?.postMessage({ type, payload });
+    workerRef.current.postMessage({ type, payload });
   }, []);
 
-  return { ...state, run };
+  const reset = useCallback(() => {
+    setState({
+      status: "idle",
+      progress: 0,
+      progressMessage: "",
+      result: null,
+      error: null,
+    });
+  }, []);
+
+  return { ...state, run, reset };
 }
